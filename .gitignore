@@ -10,3 +10,8 @@ env/
 
 # macOS
 .DS_Store
+
+# Local Rekordbox sync data
+rekordbox_export.xml
+rekordbox_sync_state.json
+missing_tracks_*.txt

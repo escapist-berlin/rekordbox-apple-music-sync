@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import subprocess
 import sys
 import urllib.parse
@@ -161,6 +162,35 @@ def parse_rekordbox_xml(xml_path: Path) -> dict:
     return {"playlists": playlists_data, "tracks": tracks}
 
 
+def filter_missing_tracks(playlists: dict, xml_path: Path) -> tuple[dict, int, Path]:
+    """Remove unavailable files and write a report next to the XML export."""
+    available_playlists = {}
+    missing_tracks = {}
+
+    for playlist_path, tracks in playlists.items():
+        available_tracks = []
+        for track in tracks:
+            if Path(track["path"]).is_file():
+                available_tracks.append(track)
+            else:
+                missing_tracks.setdefault(track["id"], track)
+        available_playlists[playlist_path] = available_tracks
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    report_path = xml_path.parent / f"missing_tracks_{timestamp}.txt"
+    with report_path.open("w", encoding="utf-8") as report:
+        if missing_tracks:
+            report.write("Tracks skipped because their files could not be found:\n\n")
+            for track in sorted(
+                missing_tracks.values(), key=lambda item: (item["artist"].casefold(), item["name"].casefold())
+            ):
+                report.write(f'{track["artist"]} - {track["name"]}\n{track["path"]}\n\n')
+        else:
+            report.write("No missing track files found.\n")
+
+    return available_playlists, len(missing_tracks), report_path
+
+
 def get_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     """Get or create a folder playlist and return its persistent ID."""
     safe_name = escape_for_applescript(name)
@@ -287,6 +317,11 @@ def main():
         data = parse_rekordbox_xml(args.xml)
         playlists = data["playlists"]
         print_info(f"Found {len(playlists)} playlists to sync")
+        playlists, missing_count, report_path = filter_missing_tracks(playlists, args.xml)
+        if missing_count:
+            print_warning(f"Skipped {missing_count} missing track file(s); see {report_path}")
+        else:
+            print_info(f"No missing track files; wrote {report_path}")
     except Exception as e:
         print_error(f"Failed to parse XML: {e}")
         sys.exit(1)

@@ -77,7 +77,10 @@ playlists are processed in batches so the AppleScript remains reliable.
 
 - Existing folders and playlists with matching names are reused.
 - Existing tracks are not removed from Music playlists.
-- Tracks whose files are missing are skipped.
+- Tracks whose files are missing are skipped. Every run writes
+  `missing_tracks_YYYY-MM-DD_HH-MM-SS.txt` beside the XML export, listing each
+  skipped track and its expected file path. The report says `No missing track
+  files found` when every referenced file is available.
 - The script adds tracks by file path, so the files must still exist at the
   locations stored in the Rekordbox export.
 - If a playlist name is repeated in different Rekordbox folders, Music app
@@ -107,7 +110,8 @@ python3 rekordbox_sync.py --xml "$HOME/Downloads/rekordbox_export.xml" --dry-run
 
 Check that the files have not been moved since the XML export. Rekordbox stores
 the file location in each track entry, and the script skips paths that no
-longer exist.
+longer exist. Open the newest `missing_tracks_*.txt` file next to the XML
+export to see the skipped tracks and their expected paths.
 
 ## Files
 

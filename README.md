@@ -1,10 +1,11 @@
 # Rekordbox to Apple Music Sync
 
-This script reads a Rekordbox XML export and recreates all Rekordbox playlists
-in Apple Music, including their folder structure and tracks.
+This script treats a Rekordbox XML export as the source of truth for playlists
+inside the `REKORDBOX` folder in Apple Music.
 
 It runs on macOS, uses the Music app through AppleScript, and has no external
-Python dependencies.
+Python dependencies. To keep repeated syncs fast, it stores the last successful
+sync state next to the XML export.
 
 ## Requirements
 
@@ -34,8 +35,10 @@ file:
 python3 rekordbox_sync.py --xml /path/to/rekordbox_export.xml --dry-run
 ```
 
-The dry run parses the XML and lists the playlists and track counts without
-changing Music.
+The dry run compares the XML with the last successful sync state and the
+playlists currently below `REKORDBOX` in Music. It lists only changes:
+playlists to create, tracks to add or remove, and playlists to delete. It does
+not change Music.
 
 When the preview looks correct, run the sync without `--dry-run`:
 
@@ -51,9 +54,9 @@ python3 rekordbox_sync.py --xml "$HOME/Downloads/rekordbox_export.xml"
 
 ## What the script creates
 
-The script creates a top-level `REKORDBOX` folder in Music and reproduces the
-folder hierarchy below it. Each Rekordbox playlist becomes a Music playlist
-with the same name.
+The first sync creates a top-level `REKORDBOX` folder in Music and reproduces
+the folder hierarchy below it. Each Rekordbox playlist becomes a Music
+playlist with the same name.
 
 For example:
 
@@ -70,25 +73,38 @@ Music:
         Friday
 ```
 
-Tracks are added to each playlist from the file paths in the XML export. Large
-playlists are processed in batches so the AppleScript remains reliable.
+Later syncs compare each playlist's file paths to the XML export. Tracks are
+added or removed to make the Apple Music playlist match Rekordbox. Large
+updates are processed in batches so the AppleScript remains reliable.
+
+The script writes `rekordbox_sync_state.json` beside the XML export after a
+successful live sync. This file stores the playlist paths, Music playlist IDs,
+and track file paths from the last sync, so future dry runs do not need to read
+every track from Music.app.
 
 ## Important behavior
 
-- Existing folders and playlists with matching names are reused.
-- Existing tracks are not removed from Music playlists.
+- Existing folders and playlists with matching paths are reused.
+- Tracks removed from a Rekordbox playlist are removed from its corresponding
+  `REKORDBOX` playlist in Music. Library files are never removed.
+- A playlist removed from Rekordbox is deleted from the `REKORDBOX` folder in
+  Music. Its library tracks are never removed.
+- On the first live run after adding sync-state support, existing `REKORDBOX`
+  playlists are trusted and recorded in `rekordbox_sync_state.json`. After that,
+  future runs show only real differences from the last successful sync.
 - Tracks whose files are missing are skipped. Every run writes
   `missing_tracks_YYYY-MM-DD_HH-MM-SS.txt` beside the XML export, listing each
   skipped track and its expected file path. The report says `No missing track
   files found` when every referenced file is available.
 - The script adds tracks by file path, so the files must still exist at the
   locations stored in the Rekordbox export.
-- If a playlist name is repeated in different Rekordbox folders, Music app
-  playlist lookup by name may be ambiguous. Keeping playlist names unique is
-  recommended.
 - The script processes every playlist in the XML export.
-- Running the script again is safe for the folder and playlist creation step;
-  Music may ignore tracks that are already present.
+- A dry run and a live sync only print playlists with differences. If no
+  output appears after the comparison, the `REKORDBOX` playlists already match
+  the XML.
+- Empty folders left after deleted playlists are not removed automatically.
+- Do not delete `rekordbox_sync_state.json` unless you want the next live run to
+  re-initialize its idea of the current `REKORDBOX` playlists.
 
 ## Troubleshooting
 

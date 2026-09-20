@@ -13,12 +13,16 @@ Usage:
 
 import argparse
 import datetime
+import json
 import subprocess
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Dict
+
+
+STATE_FILE_NAME = "rekordbox_sync_state.json"
 
 
 # ANSI color codes for terminal output
@@ -191,6 +195,102 @@ def filter_missing_tracks(playlists: dict, xml_path: Path) -> tuple[dict, int, P
     return available_playlists, len(missing_tracks), report_path
 
 
+def load_sync_state(xml_path: Path) -> tuple[dict[tuple[str, ...], dict], Path, bool]:
+    state_path = xml_path.parent / STATE_FILE_NAME
+    if not state_path.exists():
+        return {}, state_path, False
+
+    with state_path.open("r", encoding="utf-8") as fh:
+        raw_state = json.load(fh)
+
+    playlists = {}
+    for item in raw_state.get("playlists", []):
+        path = tuple(item.get("path", []))
+        if path:
+            playlists[path] = {
+                "id": item.get("id"),
+                "tracks": set(item.get("tracks", [])),
+            }
+    return playlists, state_path, True
+
+
+def save_sync_state(xml_path: Path, playlists: dict, playlist_ids: dict[tuple[str, ...], str]) -> Path:
+    state_path = xml_path.parent / STATE_FILE_NAME
+    state = {
+        "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "playlists": [],
+    }
+    for path, tracks in sorted(playlists.items()):
+        state["playlists"].append(
+            {
+                "path": list(path),
+                "id": playlist_ids.get(path),
+                "tracks": sorted(track["path"] for track in tracks),
+            }
+        )
+
+    with state_path.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return state_path
+
+
+def read_managed_playlist_ids() -> dict[tuple[str, ...], str]:
+    """Read playlist IDs below REKORDBOX without reading every track."""
+    script = r'''
+    tell application "Music"
+        set output to ""
+        repeat with p in every user playlist
+            try
+                set pathParts to {name of p as text}
+                set folder1 to parent of p
+                if class of folder1 is folder playlist then
+                    set beginning of pathParts to name of folder1 as text
+                    try
+                        set folder2 to parent of folder1
+                        if class of folder2 is folder playlist then
+                            set beginning of pathParts to name of folder2 as text
+                            try
+                                set folder3 to parent of folder2
+                                if class of folder3 is folder playlist then
+                                    set beginning of pathParts to name of folder3 as text
+                                    try
+                                        set folder4 to parent of folder3
+                                        if class of folder4 is folder playlist then
+                                            set beginning of pathParts to name of folder4 as text
+                                        end if
+                                    end try
+                                end if
+                            end try
+                        end if
+                    end try
+                end if
+
+                set AppleScript's text item delimiters to tab
+                set playlistPath to pathParts as text
+                set AppleScript's text item delimiters to ""
+
+                if item 1 of pathParts is "REKORDBOX" then
+                    set playlistId to persistent ID of p
+                    set output to output & playlistId & tab & playlistPath & linefeed
+                end if
+            end try
+        end repeat
+        return output
+    end tell
+    '''
+    playlists = {}
+    for line in run_apple_script(script).splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        playlist_id = parts[0]
+        full_path = tuple(parts[1:])
+        if len(full_path) > 1 and full_path[0] == "REKORDBOX":
+            playlists[full_path[1:]] = playlist_id
+    return playlists
+
+
 def get_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     """Get or create a folder playlist and return its persistent ID."""
     safe_name = escape_for_applescript(name)
@@ -225,8 +325,8 @@ def get_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     return run_apple_script(script)
 
 
-def create_playlist_in_folder(playlist_name: str, folder_id: Optional[str] = None) -> None:
-    """Create a playlist in the specified folder."""
+def create_playlist_in_folder(playlist_name: str, folder_id: Optional[str] = None) -> str:
+    """Create a playlist in the specified folder and return its persistent ID."""
     safe_playlist_name = escape_for_applescript(playlist_name)
     
     if folder_id is None:
@@ -238,6 +338,7 @@ def create_playlist_in_folder(playlist_name: str, folder_id: Optional[str] = Non
             on error
                 set p to make new playlist with properties {{name:"{safe_playlist_name}"}}
             end try
+            return persistent ID of p as text
         end tell
         '''
     else:
@@ -257,47 +358,56 @@ def create_playlist_in_folder(playlist_name: str, folder_id: Optional[str] = Non
             on error
                 move p to targetFolder
             end try
+            return persistent ID of p as text
         end tell
         '''
     
-    run_apple_script(script)
+    return run_apple_script(script)
 
 
-def add_tracks_to_playlist(playlist_name: str, folder_id: Optional[str], track_list: list) -> int:
-    """Add tracks to a playlist using file paths. Returns number of tracks added."""
-    if not track_list:
-        return 0
+def update_playlist_tracks(playlist_id: str, paths_to_add: set[str], paths_to_remove: set[str]) -> None:
+    """Apply file-path changes to one playlist in bounded AppleScript batches."""
+    operations = [("add", path) for path in sorted(paths_to_add)]
+    operations += [("remove", path) for path in sorted(paths_to_remove)]
+    safe_playlist_id = escape_for_applescript(playlist_id)
 
-    safe_playlist_name = escape_for_applescript(playlist_name)
-    total = 0
-    for start in range(0, len(track_list), 250):
-        add_ops = []
-        for track in track_list[start : start + 250]:
-            escaped_path = escape_for_applescript(track["path"])
-            add_ops.append(
-                f'''            try
+    for start in range(0, len(operations), 250):
+        commands = []
+        for operation, path in operations[start : start + 250]:
+            escaped_path = escape_for_applescript(path)
+            if operation == "add":
+                commands.append(
+                    f'''            try
                 add (POSIX file "{escaped_path}") to targetPlaylist
             on error errMessage
                 log "Could not add {escaped_path}: " & errMessage
             end try'''
-            )
+                )
+            else:
+                commands.append(
+                    f'''            try
+                set trackToRemove to (some file track of targetPlaylist whose location is ((POSIX file "{escaped_path}") as alias))
+                delete trackToRemove
+            on error errMessage
+                log "Could not remove {escaped_path}: " & errMessage
+            end try'''
+                )
 
-        # Resolve the playlist globally. Looking it up through its folder fails
-        # in Music.app with -1728, while this direct lookup works.
         script = f'''tell application "Music"
-    set targetPlaylist to first user playlist whose name is "{safe_playlist_name}"
-{chr(10).join(add_ops)}
-    return count of tracks of targetPlaylist
+    set targetPlaylist to first user playlist whose persistent ID is "{safe_playlist_id}"
+{chr(10).join(commands)}
 end tell
 '''
+        run_apple_script(script)
 
-        try:
-            result = run_apple_script(script)
-            total = int(result) if result.isdigit() else total + len(add_ops)
-        except Exception as e:
-            print_warning(f"Error adding tracks: {e}")
-            return total
-    return total
+
+def delete_playlist(playlist_id: str) -> None:
+    safe_playlist_id = escape_for_applescript(playlist_id)
+    run_apple_script(f'''
+    tell application "Music"
+        delete first user playlist whose persistent ID is "{safe_playlist_id}"
+    end tell
+    ''')
 
 
 def main():
@@ -330,74 +440,104 @@ def main():
         print_warning("No playlists found in XML")
         return
 
-    print()
+    print_section("Comparing Rekordbox with Apple Music...")
+    try:
+        current_playlist_ids = read_managed_playlist_ids()
+    except Exception as e:
+        print_error(f"Failed to read REKORDBOX playlists from Music: {e}")
+        sys.exit(1)
 
-    # Dry run summary
-    if args.dry_run:
-        print_section("📋 Dry Run - What would be created:")
-        for path, tracks in sorted(playlists.items()):
-            full_path = ("REKORDBOX",) + path
-            print_info(f"{' / '.join(full_path)} ({len(tracks)} tracks)")
-        print()
+    state_playlists, state_path, has_state = load_sync_state(args.xml)
+    if not has_state:
+        print_warning(
+            f"No previous sync state found. Existing REKORDBOX playlists will be trusted on the first live run; state file: {state_path}"
+        )
+
+    changes = []
+    for path, tracks in sorted(playlists.items()):
+        desired_paths = {track["path"] for track in tracks}
+        state = state_playlists.pop(path, None)
+        playlist_id = current_playlist_ids.get(path) or (state or {}).get("id")
+
+        if state is None and path in current_playlist_ids:
+            continue
+        if playlist_id is None:
+            changes.append(("create", path, desired_paths, set(), None))
+            continue
+
+        previous_paths = state["tracks"] if state else set()
+        paths_to_add = desired_paths - previous_paths
+        paths_to_remove = previous_paths - desired_paths
+        if paths_to_add or paths_to_remove:
+            changes.append(("update", path, paths_to_add, paths_to_remove, playlist_id))
+
+    orphan_paths = set(state_playlists) | (set(current_playlist_ids) - set(playlists))
+    for path in sorted(orphan_paths):
+        playlist_id = current_playlist_ids.get(path) or state_playlists.get(path, {}).get("id")
+        if playlist_id:
+            changes.append(("delete", path, set(), set(), playlist_id))
+
+    print()
+    if not changes:
+        print_success("Apple Music is already in sync with the Rekordbox XML.")
+        if not args.dry_run:
+            saved_state = save_sync_state(args.xml, playlists, current_playlist_ids)
+            print_info(f"Wrote sync state: {saved_state}")
         return
 
-    # Create playlists
-    print_section("Creating folder structure and playlists...")
-    print_info(f"Total playlists to create: {len(playlists)}\n")
+    heading = "📋 Dry Run - Changes:" if args.dry_run else "Applying changes:"
+    print_section(heading)
+    for change_type, path, paths_to_add, paths_to_remove, _ in changes:
+        display_path = " / ".join(("REKORDBOX",) + path)
+        if change_type == "create":
+            print_info(f"CREATE {display_path} (+{len(paths_to_add)} tracks)")
+        elif change_type == "update":
+            print_info(f"UPDATE {display_path} (+{len(paths_to_add)} / -{len(paths_to_remove)} tracks)")
+        else:
+            print_info(f"DELETE {display_path}")
 
-    created_count = 0
-    failed_count = 0
-    total_tracks = 0
-    
-    # Cache for folder IDs to avoid recreating them
+    if args.dry_run:
+        return
+
     folder_cache: Dict[tuple, str] = {}
-
-    for idx, (path, tracks) in enumerate(sorted(playlists.items()), 1):
-        full_path = ("REKORDBOX",) + path
-        playlist_name = full_path[-1]
-        folder_path = full_path[:-1]
-
+    completed = 0
+    failed = 0
+    for change_type, path, paths_to_add, paths_to_remove, playlist_id in changes:
+        display_path = " / ".join(("REKORDBOX",) + path)
         try:
-            # Create folder structure (using cache to avoid duplication)
-            folder_id = None
-            if len(folder_path) > 0:
-                # Build folder path step by step
+            if change_type == "create":
+                folder_id = None
+                folder_path = ("REKORDBOX",) + path[:-1]
                 for i in range(len(folder_path)):
-                    current_folder_path = folder_path[:i+1]
+                    current_folder_path = folder_path[: i + 1]
                     if current_folder_path not in folder_cache:
                         parent_id = folder_cache.get(folder_path[:i])
-                        folder_name = current_folder_path[-1]
-                        folder_id = get_or_create_folder(folder_name, parent_id)
-                        folder_cache[current_folder_path] = folder_id
-                    else:
-                        folder_id = folder_cache[current_folder_path]
-
-            # Create playlist
-            create_playlist_in_folder(playlist_name, folder_id)
-
-            # Add tracks
-            track_count = add_tracks_to_playlist(playlist_name, folder_id, tracks)
-            total_tracks += track_count
-
-            display_path = " / ".join(full_path)
-            print_success(f"[{idx}/{len(playlists)}] {display_path} ({track_count}/{len(tracks)} tracks)")
-            created_count += 1
-            
-            # Show progress every 20 playlists
-            if idx % 20 == 0:
-                print_info(f"Progress: {created_count} created, {failed_count} failed")
-
+                        folder_cache[current_folder_path] = get_or_create_folder(
+                            current_folder_path[-1], parent_id
+                        )
+                    folder_id = folder_cache[current_folder_path]
+                playlist_id = create_playlist_in_folder(path[-1], folder_id)
+                current_playlist_ids[path] = playlist_id
+                update_playlist_tracks(playlist_id, paths_to_add, set())
+            elif change_type == "update":
+                update_playlist_tracks(playlist_id, paths_to_add, paths_to_remove)
+            else:
+                delete_playlist(playlist_id)
+                current_playlist_ids.pop(path, None)
+            print_success(f"{change_type.upper()} {display_path}")
+            completed += 1
         except Exception as e:
-            display_path = " / ".join(full_path)
-            print_error(f"[{idx}/{len(playlists)}] {display_path}: {str(e)[:60]}")
-            failed_count += 1
+            print_error(f"{change_type.upper()} {display_path}: {str(e)[:100]}")
+            failed += 1
 
     print()
     print_header("✨ Summary")
-    print_success(f"Created {created_count} playlists in REKORDBOX folder")
-    if failed_count > 0:
-        print_warning(f"Failed to create {failed_count} playlists")
-    print_info(f"Added {total_tracks} tracks to playlists")
+    print_success(f"Applied {completed} playlist change(s)")
+    if failed:
+        print_warning(f"Failed to apply {failed} playlist change(s)")
+    else:
+        saved_state = save_sync_state(args.xml, playlists, current_playlist_ids)
+        print_info(f"Wrote sync state: {saved_state}")
     print()
 
 
